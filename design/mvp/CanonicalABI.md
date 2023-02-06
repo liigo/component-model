@@ -218,19 +218,22 @@ definitions via the `cx` parameter:
 class Context:
   opts: CanonicalOptions
   inst: ComponentInstance
+  args: Optional[[any]]
   lenders: [HandleBase]
   borrow_count: int
 
-  def __init__(self, opts, inst):
+  def __init__(self, opts, inst, args = None):
     self.opts = opts
     self.inst = inst
+    self.args = args
     self.lenders = []
     self.borrow_count = 0
 ```
 One `Context` is created for each call for both the caller and callee. Thus, a
 cross-component call will create 2 `Context` objects for the call, while a
 component-to-host or host-to-component call will create a single `Context` for
-the wasm caller or callee, resp.
+the wasm caller or callee, resp. The `args` field stores the array of lifted
+argument values of the call.
 
 The `lenders` and `borrow_count` fields will be used below for dynamically
 enforcing the rules of borrow handles. The one thing to mention here is that
@@ -246,6 +249,7 @@ class CanonicalOptions:
   string_encoding: str
   realloc: Callable[[int,int,int,int],int]
   post_return: Callable[[],None]
+  dedupe: bool
 ```
 
 The `inst` field represents the component instance that the currently-executing
@@ -281,7 +285,10 @@ class ResourceType(Type):
 The `HandleBase` class and its subclasses represent handle values referring to
 resources. The `rep` field of `HandleBase` stores the representation value
 (currently fixed to `i32`) pass to `resource.new` for the resource that this
-handle refers to.
+handle refers to. The `lend_count` field maintains a count of the outstanding
+handles that were lent from this handle (by calls to `borrow`-taking
+functions). This count is used below to dynamically enforce the invariant that
+a handle cannot be dropped while it has currently lent out a `borrow`.
 ```python
 @dataclass
 class HandleBase:
@@ -292,40 +299,88 @@ class HandleBase:
     trap_if(not rt.impl.may_enter)
     if rt.dtor:
       rt.dtor(self.rep)
+```
 
+The `OwnHandle` class describes a runtime `own` handle value. The `parent`
+field points to the runtime handle supplied for the the parent parameter named
+by the handle type. This is used for runtime bookkeeping below to ensure that
+child handles are dropped before their parent handles.
+```python
 @dataclass
 class OwnHandle(HandleBase):
-  pass
+  parent: Optional[OwnHandle | BorrowHandle] = None
 ```
-The `lend_count` field maintains a count of the outstanding handles that were
-lent from this handle (by calls to `borrow`-taking functions). This count is
-used below to dynamically enforce the invariant that a handle cannot be
-dropped while it has currently lent out a `borrow`.
 
+The `RefHandle` class describes a runtime `ref` handle value. The `ref` field
+points to an object storing a mutable reference-count that is incremented and
+decremented by the `ref` handles. This `ref` pointer is also used to establish
+resource identity during de-duplication.
+```python
+@dataclass
+class RefHandle(HandleBase):
+  ref: RefCountCell
+  dedupe: Optional[bool]
+  parent: Optional[OwnHandle | BorrowHandle] = None
+
+  def incref(self):
+    self.ref.ct += 1
+
+  def decref(self, rt: ResourceType):
+    self.ref.ct -= 1
+    if self.ref.ct == 0:
+      self.destroy(rt)
+
+@dataclass
+class RefCountCell:
+  ct: int
+```
+The `dedupe` field captures the value of `CanonicalOptions.dedupe` when the
+handle was lowered and could be optimized away when all the canonical options
+of a single component are the same.
+
+The `BorrowHandle` class describes a runtime `borrow` handle value:
 ```python
 @dataclass
 class BorrowHandle(HandleBase):
+  lender: HandleBase
   cx: Optional[Context]
 ```
-The `BorrowHandle` class additionally stores the `Context` of the call that
-created this borrow for the purposes of `borrow_count` bookkeeping below.
-Until async is added to the Component Model, because of the non-reentrancy
-of components, there is at most one callee `Context` alive for a given
-component and thus the `cx` field of `BorrowHandle` can be optimized away.
+While `BorrowHandle` logically stores two fields, both can be optimized away
+(at the moment):
+ * The `lender` field points to the original handle that was lifted to produce
+   this borrowed handle. This field is only used in a lowering context where
+   the value can alternatively be recovered from a fixed stack frame location.
+ * The `cx` field points to the `Context` of the call that created this
+   borrow. Until async is added, because of the non-reentrancy of components,
+   there is at most one callee `Context` alive for a component at a time and
+   can thus be alternatively recovered from the global instance state.
 
 `HandleTable` (singular) encapsulates a single mutable, growable array
 of handles that all share the same `ResourceType`. Defining `HandleTable` in
-chunks, we start with the fields and `add` method:
+chunks, we start with the fields and initialization:
 ```python
 class HandleTable:
   array: [Optional[HandleBase]]
   free: [int]
+  deduped: MutableMapping[Tuple[int, int], int]
 
   def __init__(self):
     self.array = []
     self.free = []
+    self.deduped = dict()
+```
+The `free` list is used below to maintain a list of recyclable "holes" in
+`array`. An optimizing implementation could instead store the `free` list
+inline in the free elements of `array`. The `dedupe` map is used below
+to deduplicate `ref` handles and could also be optimized away under some
+conditions described below.
 
+The `add` method adds a given handle that was lowered with a given value type
+constructor `vt`:
+```python
   def add(self, h, vt):
+    if vt == 'ref' and h.dedupe and (dup := self.deduped.get((id(h.ref), id(h.parent)))):
+      return dup
     if self.free:
       i = self.free.pop()
       assert(self.array[i] is None)
@@ -334,16 +389,44 @@ class HandleTable:
       i = len(self.array)
       self.array.append(h)
     match vt:
+      case 'own':
+        if h.parent:
+          h.parent.lend_count += 1
+      case 'ref':
+        if h.parent:
+          h.parent.lend_count += 1
+        h.incref()
+        if h.dedupe:
+          self.deduped[(id(h.ref), id(h.parent))] = i
       case 'borrow':
         h.cx.borrow_count += 1
     return i
 ```
-The `HandleTable` class maintains a dense array of handles that can contain
-holes created by the `transfer_or_drop` method (defined below). These holes are
-kept in a separate Python list here, but an optimizing implementation could
-instead store the free list in the free elements of `array`. When adding a new
-handle, `HandleTable` first consults the `free` list, which is popped LIFO to
-better detect use-after-free bugs in the guest code.
+Before adding a handle, the `dedupe` map is consulted to determine whether a
+handle to the same resource is already present in the table. Because `ref`
+handles have entirely different lifetimes depending their parent handle, the
+parent handle identity is included as part of the deduplication key so that
+children of each distinct parent are considered distinct (with `id(None)`
+acting as a singleton parent). While the Python code above uses a dictionary,
+an effective optimization (e.g., used in browsers when wrapping C++ DOM
+objects) would be to use a small fixed-size array in the `RefCountCell` to
+cache dictionary entries.
+
+When adding a new handle, `add` first consults the `free` list to
+preferentially reuse an empty element. Elements are reused in LIFO order to
+more-eagerly surface intra-component use-after-free bugs. Afterwards,
+handle-type-specific bookkeeping is performed to ensure that the handle does
+become invalid while it still exists in the table. Since `vt` is always a
+caller-supplied constant, the expectation is that the relevant case is inlined
+into the caller.
+
+Lastly, per-handle-type bookkeeping is performed to dynamically enforce
+handle invariants:
+* Child handles prevent their parent from being dropped by incrementing the
+  parent's `lend_count` (guarded to be zero by `transfer_or_drop` below).
+* Borrowed handles ensure that the callee drops all borrowed handles by the
+  end of the call by incrementing a per-call `borrow_count` (guarded to be
+  zero by `canon_lift` below).
 
 The `get` method is used by other `HandleTable` methods and canonical
 definitions below and uses dynamic guards to catch out-of-bounds and
@@ -355,26 +438,33 @@ use-after-free:
     return self.array[i]
 ```
 
-The last method of `HandleTable`, `transfer_or_drop`, is used to transfer or
-drop a handle out of the handle table. `transfer_or_drop` adds the removed
-table element to the `free` list for later recycling by `add` (above).
+The `transfer_or_drop` method is used to either transfer a handle to another
+component or drop the handle completely. In either case, `transfer_or_drop`
+symmetrically undoes the bookkeeping performed by `add` above and adds the
+removed table element to the `free` list for later recycling by `add`.
 ```python
   def transfer_or_drop(self, i, vt, rt, drop):
     h = self.get(i)
     trap_if(h.lend_count != 0)
     match vt:
       case 'own':
+        if h.parent:
+          h.parent.lend_count -= 1
         if drop:
           h.destroy(rt)
+      case 'ref':
+        if h.parent:
+          h.parent.lend_count -= 1
+        h.decref(rt)
+        if h.dedupe:
+          del self.deduped[(id(h.ref), id(h.parent))]
       case 'borrow':
         h.cx.borrow_count -= 1
     self.array[i] = None
     self.free.append(i)
 ```
-The `lend_count` guard ensures that no dangling borrows are created when
-destroying a resource. The bookkeeping performed for borrowed handles records
-the fulfillment of the obligation of the borrower to drop the handle before the
-end of the call.
+As mentioned above, the `lend_count` guard ensures that all borrow and child
+handles depending on this handle have already been dropped.
 
 Finally, we can define `HandleTables` (plural) as simply a wrapper around
 a mutable mapping from `ResourceType` to `HandleTable`:
@@ -438,6 +528,7 @@ def load(cx, ptr, t):
     case Variant(cases) : return load_variant(cx, ptr, cases)
     case Flags(labels)  : return load_flags(cx, ptr, labels)
     case Own()          : return lift_own(cx, load_int(opts, ptr, 4), t)
+    case Ref()          : return lift_ref(cx, load_int(opts, ptr, 4), t)
     case Borrow()       : return lift_borrow(cx, load_int(opts, ptr, 4), t)
 ```
 
@@ -615,18 +706,36 @@ def unpack_flags_from_int(i, labels):
   return record
 ```
 
-Next, `own` handles are lifted by extracting the `OwnHandle` from the current
+`own` handles are lifted by extracting the `OwnHandle` from the current
 instance's handle table. This ensures that `own` handles are always uniquely
 referenced.
 ```python
 def lift_own(cx, i, t):
   h = cx.inst.handles.get(i, t.rt)
   trap_if(not isinstance(h, OwnHandle))
+  trap_if(h.parent is not None and (t.parent_index is None or h.parent is not cx.args[t.parent_index]))
   cx.inst.handles.transfer(i, 'own', t.rt)
-  return OwnHandle(h.rep, 0)
+  return OwnHandle(h.rep, 0, None)
 ```
+The second `trap_if` ensures that the caller and callee agree on the parent,
+which is a runtime handle value. `None` is passed for the `parent` field of
+`OwnHandle` because this field is meant to be filled in by the lowering side
+with the caller's parent handle.
 
-Lastly, `borrow` handles are lifted by handing out a `BorrowHandle` storing the
+`ref` handles leave the source handle unmodified when lifted, sharing the
+source handle's `RefCountCell` with the destination (which will take care of
+calling `incref`/`decref`).
+```python
+def lift_ref(cx, i, t):
+  h = cx.inst.handles.get(i, t.rt)
+  trap_if(not isinstance(h, RefHandle))
+  trap_if(h.parent is not None and (t.parent_index is None or h.parent is not cx.args[t.parent_index]))
+  return RefHandle(h.rep, 0, h.ref, None)
+```
+`None` is passed for the `dedupe` field of `RefHandle` because this field is
+meant to be filled in by the lowering side with the lowering `Context.dedupe`.
+
+`borrow` handles are lifted by handing out a `BorrowHandle` storing the
 same representation value as the lent handle. By incrementing `lend_count`,
 `lift_own` ensures that the lent handle will not be dropped before the end of
 the call (see the matching decrement in `canon_lower`) which transitively
@@ -636,8 +745,10 @@ def lift_borrow(cx, i, t):
   h = cx.inst.handles.get(i, t.rt)
   h.lend_count += 1
   cx.lenders.append(h)
-  return BorrowHandle(h.rep, 0, None)
+  return BorrowHandle(h.rep, 0, h, None)
 ```
+`None` is passed for the `cx` field of `RefHandle` because this field is meant
+to be filled in by the lowering side with the lowering `Context`.
 
 
 ### Storing
@@ -668,6 +779,7 @@ def store(cx, v, t, ptr):
     case Variant(cases) : store_variant(cx, v, ptr, cases)
     case Flags(labels)  : store_flags(cx, v, ptr, labels)
     case Own()          : store_int(cx, lower_own(opts, v, t), ptr, 4)
+    case Ref()          : store_int(cx, lower_ref(opts, v, t), ptr, 4)
     case Borrow()       : store_int(cx, lower_borrow(opts, v, t), ptr, 4)
 ```
 
@@ -978,13 +1090,41 @@ def pack_flags_into_int(v, labels):
   return i
 ```
 
-Finally, `own` and `borrow` handles are lowered by inserting them into the
-current component instance's `HandleTable`:
+Lowering `own` and `ref` handles first fills in some fields (that were set to
+`None` during lowering) and then inserts the handles into the current
+component instance's `HandleTable`, resulting in an `i32` index.
 ```python
+def get_parent(cx, t):
+  if t.parent_index is None:
+    return None
+  arg = cx.args[t.parent_index].lender
+  if not isinstance(arg, BorrowHandle) and arg.parent is not None:
+    return arg.parent
+  return arg
+
 def lower_own(cx, h, t):
   assert(isinstance(h, OwnHandle))
+  h.parent = get_parent(cx, t)
   return cx.inst.handles.add(h, 'own', t.rt)
 
+def lower_ref(cx, h, t):
+  h.parent = get_parent(cx, t)
+  h.dedupe = cx.opts.dedupe
+  return cx.inst.handles.add(h, 'ref', t.rt)
+```
+To compute the `parent` field, the `get_parent` function first looks at the
+actual handle argument passed to the call and then skips to the parent of any
+child handles (which, inductively, is not a child handle). This skipping
+ensures that the parent-equality check in lifting (above) allows transitive
+parents (e.g., an the child-of-a-child-of-a-parent). It also specifies that
+deduplication doesn't care about the exact path taken to reach a child: all
+paths to the same child resource starting from the same non-child handle will
+have the same identity.
+
+Lowering `borrow` handles optimizes the case where a borrowed handle is passed
+to the component that implemented the resource type, recognizing the fact that
+the only thing the borrowed handle is good for is calling `handle.rep`.
+```python
 def lower_borrow(cx, h, t):
   assert(isinstance(h, BorrowHandle))
   if cx.inst is t.rt.impl:
@@ -992,11 +1132,6 @@ def lower_borrow(cx, h, t):
   h.cx = cx
   return cx.inst.handles.add(h, 'borrow', t.rt)
 ```
-The special case in `lower_borrow` is an optimization, recognizing that, when
-a borrowed handle is passed to the component that implemented the resource
-type, the only thing the borrowed handle is good for is calling
-`resource.rep`, so lowering might as well avoid the overhead of creating an
-intermediate borrow handle.
 
 
 ### Flattening
@@ -1147,6 +1282,7 @@ def lift_flat(cx, vi, t):
     case Variant(cases) : return lift_flat_variant(cx, vi, cases)
     case Flags(labels)  : return lift_flat_flags(vi, labels)
     case Own()          : return lift_own(cx, vi.next('i32'), t)
+    case Ref()          : return lift_ref(cx, vi.next('i32'), t)
     case Borrow()       : return lift_borrow(cx, vi.next('i32'), t)
 ```
 
@@ -1271,6 +1407,7 @@ def lower_flat(cx, v, t):
     case Variant(cases) : return lower_flat_variant(cx, v, cases)
     case Flags(labels)  : return lower_flat_flags(v, labels)
     case Own()          : return [Value('i32', lower_own(cx, v, t))]
+    case Ref()          : return [Value('i32', lower_ref(cx, v, t))]
     case Borrow()       : return [Value('i32', lower_borrow(cx, v, t))]
 ```
 
@@ -1429,7 +1566,7 @@ component*.
 Given the above closure arguments, `canon_lift` is defined:
 ```python
 def canon_lift(opts, inst, callee, ft, args):
-  cx = Context(opts, inst)
+  cx = Context(opts, inst, args)
   trap_if(not inst.may_enter)
 
   assert(inst.may_leave)
@@ -1495,6 +1632,7 @@ def canon_lower(opts, inst, callee, calling_import, ft, flat_args):
   results, post_return = callee(args)
 
   inst.may_leave = False
+  cx.args = args
   flat_results = lower_values(cx, MAX_FLAT_RESULTS, results, ft.result_types(), flat_args)
   inst.may_leave = True
 
@@ -1554,19 +1692,24 @@ the AOT compiler as requiring an intermediate copy to implement the above
 
 ### `canon *.new`
 
-For a canonical definition:
+For one of the following canonical definitions:
 ```
 (canon own.new $rt (core func $f))
+(canon ref.new $rt dedupe? (core func $f))
 ```
 validation specifies:
 * `$rt` must refer to locally-defined (not imported) resource type
 * `$f` is given type `(func (param i32) (result i32))`
 
-Calling `$f` invokes the following function:
+Calling `$f` invokes one of the following functions:
 ```python
 def canon_own_new(inst, rt, rep):
   h = OwnHandle(rep, 0)
   return inst.handles.add(h, 'own', rt)
+
+def canon_ref_new(inst, rt, dedupe, rep):
+  h = RefHandle(rep, 0, RefCountCell(0), dedupe)
+  return inst.handles.add(h, 'ref', rt)
 ```
 
 ### `canon *.drop`
@@ -1574,6 +1717,7 @@ def canon_own_new(inst, rt, rep):
 For one of the following canonical definitions:
 ```
 (canon own.drop $rt (core func $f))
+(canon ref.drop $rt (core func $f))
 (canon borrow.drop $rt (core func $f))
 ```
 validation specifies:
@@ -1586,6 +1730,11 @@ def canon_own_drop(inst, rt, i):
   h = inst.handles.get(i, rt)
   trap_if(not isinstance(h, OwnHandle))
   inst.handles.drop(i, 'own', rt)
+
+def canon_ref_drop(inst, rt, i):
+  h = inst.handles.get(i, rt)
+  trap_if(not isinstance(h, RefHandle))
+  inst.handles.drop(i, 'ref', rt)
 
 def canon_borrow_drop(inst, rt, i):
   h = inst.handles.get(i, rt)
@@ -1611,6 +1760,29 @@ def canon_handle_rep(inst, rt, i):
 ```
 Note that the "locally-defined" requirement above ensures that only the
 component instance defining a resource can access its representation.
+
+
+### `canon ref.from-own`
+
+For one the following canonical definition:
+```
+(canon ref.from-own $rt dedupe? (core func $f))
+```
+validation specifies:
+* `$rt` must refer to a resource type
+* `$f` is given type `(func (param i32))`
+
+Calling `$f` invokes the following function:
+```python
+def canon_ref_from_own(inst, rt, dedupe, i):
+  h = inst.handles.get(i, rt)
+  trap_if(not isinstance(h, OwnHandle))
+  ref = RefHandle(h.rep, 0, RefCountCell(0), dedupe, h.parent)
+  inst.handles.transfer(i, 'own', rt)
+  assert(i == inst.handles.add(ref, 'ref', rt))
+```
+The spec-level `assert()` captures the spec-level invariant that the `transfer`
+followed by `add` will have the net effect of modifying the handle in-place.
 
 
 

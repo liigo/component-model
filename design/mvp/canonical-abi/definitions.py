@@ -163,8 +163,16 @@ class Flags(ValType):
 class HandleType(ValType):
   rt: ResourceType
 
-class Own(HandleType): pass
-class Borrow(HandleType): pass
+@dataclass
+class Own(HandleType):
+  parent_index: Optional[int] = None
+
+@dataclass
+class Ref(HandleType):
+  parent_index: Optional[int] = None
+
+class Borrow(HandleType):
+  pass
 
 ### Despecialization
 
@@ -285,12 +293,14 @@ def num_i32_flags(labels):
 class Context:
   opts: CanonicalOptions
   inst: ComponentInstance
+  args: Optional[[any]]
   lenders: [HandleBase]
   borrow_count: int
 
-  def __init__(self, opts, inst):
+  def __init__(self, opts, inst, args = None):
     self.opts = opts
     self.inst = inst
+    self.args = args
     self.lenders = []
     self.borrow_count = 0
 
@@ -301,6 +311,7 @@ class CanonicalOptions:
   string_encoding: str
   realloc: Callable[[int,int,int,int],int]
   post_return: Callable[[],None]
+  dedupe: bool
 
 #
 
@@ -333,14 +344,37 @@ class HandleBase:
     if rt.dtor:
       rt.dtor(self.rep)
 
+#
+
 @dataclass
 class OwnHandle(HandleBase):
-  pass
+  parent: Optional[OwnHandle | BorrowHandle] = None
+
+#
+
+@dataclass
+class RefHandle(HandleBase):
+  ref: RefCountCell
+  dedupe: Optional[bool]
+  parent: Optional[OwnHandle | BorrowHandle] = None
+
+  def incref(self):
+    self.ref.ct += 1
+
+  def decref(self, rt: ResourceType):
+    self.ref.ct -= 1
+    if self.ref.ct == 0:
+      self.destroy(rt)
+
+@dataclass
+class RefCountCell:
+  ct: int
 
 #
 
 @dataclass
 class BorrowHandle(HandleBase):
+  lender: HandleBase
   cx: Optional[Context]
 
 #
@@ -348,12 +382,18 @@ class BorrowHandle(HandleBase):
 class HandleTable:
   array: [Optional[HandleBase]]
   free: [int]
+  deduped: MutableMapping[Tuple[int, int], int]
 
   def __init__(self):
     self.array = []
     self.free = []
+    self.deduped = dict()
+
+#
 
   def add(self, h, vt):
+    if vt == 'ref' and h.dedupe and (dup := self.deduped.get((id(h.ref), id(h.parent)))):
+      return dup
     if self.free:
       i = self.free.pop()
       assert(self.array[i] is None)
@@ -362,6 +402,15 @@ class HandleTable:
       i = len(self.array)
       self.array.append(h)
     match vt:
+      case 'own':
+        if h.parent:
+          h.parent.lend_count += 1
+      case 'ref':
+        if h.parent:
+          h.parent.lend_count += 1
+        h.incref()
+        if h.dedupe:
+          self.deduped[(id(h.ref), id(h.parent))] = i
       case 'borrow':
         h.cx.borrow_count += 1
     return i
@@ -380,8 +429,16 @@ class HandleTable:
     trap_if(h.lend_count != 0)
     match vt:
       case 'own':
+        if h.parent:
+          h.parent.lend_count -= 1
         if drop:
           h.destroy(rt)
+      case 'ref':
+        if h.parent:
+          h.parent.lend_count -= 1
+        h.decref(rt)
+        if h.dedupe:
+          del self.deduped[(id(h.ref), id(h.parent))]
       case 'borrow':
         h.cx.borrow_count -= 1
     self.array[i] = None
@@ -433,6 +490,7 @@ def load(cx, ptr, t):
     case Variant(cases) : return load_variant(cx, ptr, cases)
     case Flags(labels)  : return load_flags(cx, ptr, labels)
     case Own()          : return lift_own(cx, load_int(opts, ptr, 4), t)
+    case Ref()          : return lift_ref(cx, load_int(opts, ptr, 4), t)
     case Borrow()       : return lift_borrow(cx, load_int(opts, ptr, 4), t)
 
 #
@@ -580,8 +638,17 @@ def unpack_flags_from_int(i, labels):
 def lift_own(cx, i, t):
   h = cx.inst.handles.get(i, t.rt)
   trap_if(not isinstance(h, OwnHandle))
+  trap_if(h.parent is not None and (t.parent_index is None or h.parent is not cx.args[t.parent_index]))
   cx.inst.handles.transfer(i, 'own', t.rt)
-  return OwnHandle(h.rep, 0)
+  return OwnHandle(h.rep, 0, None)
+
+#
+
+def lift_ref(cx, i, t):
+  h = cx.inst.handles.get(i, t.rt)
+  trap_if(not isinstance(h, RefHandle))
+  trap_if(h.parent is not None and (t.parent_index is None or h.parent is not cx.args[t.parent_index]))
+  return RefHandle(h.rep, 0, h.ref, None)
 
 #
 
@@ -589,7 +656,7 @@ def lift_borrow(cx, i, t):
   h = cx.inst.handles.get(i, t.rt)
   h.lend_count += 1
   cx.lenders.append(h)
-  return BorrowHandle(h.rep, 0, None)
+  return BorrowHandle(h.rep, 0, h, None)
 
 ### Storing
 
@@ -615,6 +682,7 @@ def store(cx, v, t, ptr):
     case Variant(cases) : store_variant(cx, v, ptr, cases)
     case Flags(labels)  : store_flags(cx, v, ptr, labels)
     case Own()          : store_int(cx, lower_own(opts, v, t), ptr, 4)
+    case Ref()          : store_int(cx, lower_ref(opts, v, t), ptr, 4)
     case Borrow()       : store_int(cx, lower_borrow(opts, v, t), ptr, 4)
 
 #
@@ -852,9 +920,25 @@ def pack_flags_into_int(v, labels):
 
 #
 
+def get_parent(cx, t):
+  if t.parent_index is None:
+    return None
+  arg = cx.args[t.parent_index].lender
+  if not isinstance(arg, BorrowHandle) and arg.parent is not None:
+    return arg.parent
+  return arg
+
 def lower_own(cx, h, t):
   assert(isinstance(h, OwnHandle))
+  h.parent = get_parent(cx, t)
   return cx.inst.handles.add(h, 'own', t.rt)
+
+def lower_ref(cx, h, t):
+  h.parent = get_parent(cx, t)
+  h.dedupe = cx.opts.dedupe
+  return cx.inst.handles.add(h, 'ref', t.rt)
+
+#
 
 def lower_borrow(cx, h, t):
   assert(isinstance(h, BorrowHandle))
@@ -967,6 +1051,7 @@ def lift_flat(cx, vi, t):
     case Variant(cases) : return lift_flat_variant(cx, vi, cases)
     case Flags(labels)  : return lift_flat_flags(vi, labels)
     case Own()          : return lift_own(cx, vi.next('i32'), t)
+    case Ref()          : return lift_ref(cx, vi.next('i32'), t)
     case Borrow()       : return lift_borrow(cx, vi.next('i32'), t)
 
 #
@@ -1066,6 +1151,7 @@ def lower_flat(cx, v, t):
     case Variant(cases) : return lower_flat_variant(cx, v, cases)
     case Flags(labels)  : return lower_flat_flags(v, labels)
     case Own()          : return [Value('i32', lower_own(cx, v, t))]
+    case Ref()          : return [Value('i32', lower_ref(cx, v, t))]
     case Borrow()       : return [Value('i32', lower_borrow(cx, v, t))]
 
 #
@@ -1164,7 +1250,7 @@ def lower_values(cx, max_flat, vs, ts, out_param = None):
 ### `canon lift`
 
 def canon_lift(opts, inst, callee, ft, args):
-  cx = Context(opts, inst)
+  cx = Context(opts, inst, args)
   trap_if(not inst.may_enter)
 
   assert(inst.may_leave)
@@ -1202,6 +1288,7 @@ def canon_lower(opts, inst, callee, calling_import, ft, flat_args):
   results, post_return = callee(args)
 
   inst.may_leave = False
+  cx.args = args
   flat_results = lower_values(cx, MAX_FLAT_RESULTS, results, ft.result_types(), flat_args)
   inst.may_leave = True
 
@@ -1221,12 +1308,21 @@ def canon_own_new(inst, rt, rep):
   h = OwnHandle(rep, 0)
   return inst.handles.add(h, 'own', rt)
 
+def canon_ref_new(inst, rt, dedupe, rep):
+  h = RefHandle(rep, 0, RefCountCell(0), dedupe)
+  return inst.handles.add(h, 'ref', rt)
+
 ### `canon *.drop`
 
 def canon_own_drop(inst, rt, i):
   h = inst.handles.get(i, rt)
   trap_if(not isinstance(h, OwnHandle))
   inst.handles.drop(i, 'own', rt)
+
+def canon_ref_drop(inst, rt, i):
+  h = inst.handles.get(i, rt)
+  trap_if(not isinstance(h, RefHandle))
+  inst.handles.drop(i, 'ref', rt)
 
 def canon_borrow_drop(inst, rt, i):
   h = inst.handles.get(i, rt)
@@ -1238,3 +1334,12 @@ def canon_borrow_drop(inst, rt, i):
 def canon_handle_rep(inst, rt, i):
   h = inst.handles.get(i, rt)
   return h.rep
+
+### `canon ref.from-own`
+
+def canon_ref_from_own(inst, rt, dedupe, i):
+  h = inst.handles.get(i, rt)
+  trap_if(not isinstance(h, OwnHandle))
+  ref = RefHandle(h.rep, 0, RefCountCell(0), dedupe, h.parent)
+  inst.handles.transfer(i, 'own', rt)
+  assert(i == inst.handles.add(ref, 'ref', rt))

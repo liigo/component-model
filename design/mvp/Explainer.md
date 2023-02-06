@@ -495,7 +495,8 @@ defvaltype    ::= bool
                 | (union <valtype>+)
                 | (option <valtype>)
                 | (result <valtype>? (error <valtype>)?)
-                | (own <typeidx>)
+                | (own <typeidx> <label>?)
+                | (ref <typeidx> <label>?)
                 | (borrow <typeidx>)
 valtype       ::= <typeidx>
                 | <defvaltype>
@@ -540,7 +541,8 @@ sets of abstract values:
 | `record`                  | heterogeneous [tuples] of named values |
 | `variant`                 | heterogeneous [tagged unions] of named values |
 | `list`                    | homogeneous, variable-length [sequences] of values |
-| `own`                     | a unique, opaque address of a resource that will be destroyed when this value is dropped |
+| `own`                     | a unique, opaque address of a resource that will be destroyed when this value is dropped, which must happen before the `parent` is dropped, if present |
+| `ref`                     | an opaque address of a resource that will be destroyed when the last reference is dropped, which must happen before the `parent` is dropped, if present |
 | `borrow`                  | an opaque address of a resource that must be dropped before the current export call returns |
 
 How these abstract values are produced and consumed from Core WebAssembly
@@ -559,19 +561,22 @@ value so that:
    assumptions that NaN payload bits are preserved by the other side (since
    they often aren't).
 
-The `own` and `borrow` value types are both *handle types*. Handles logically
-contain the opaque address of a resource and avoid copying the resource when
-passed across component boundaries. By way of metaphor to operating systems,
-handles are analogous to file descriptors, which are stored in a table and may
-only be used indirectly by untrusted user-mode processes via their integer
-index in the table. In the Component Model, handles are lifted-from and
-lowered-into `i32` values that index an encapsulated per-component-instance
-*handle table* that is maintained by the canonical function definitions
-described [below](#canonical-definitions). The uniqueness and dropping
-conditions mentioned above are enforced at runtime by the Component Model
-through these canonical definitions. The `typeidx` immediate of a handle type
-must refer to a `resource` type (described below) that statically classifies
-the particular kinds of resources the handle can point to.
+The `own`, `ref, and `borrow` value types are all *handle types*. Handles
+logically contain the opaque address of a resource and avoid copying the
+resource when passed across component boundaries. By way of metaphor to
+operating systems, handles are analogous to file descriptors, which are
+stored in a table and may only be used indirectly by untrusted user-mode
+processes via their integer index in the table. In the Component Model,
+handles are lifted-from and lowered-into `i32` values that index an
+encapsulated per-component-instance *handle table* that is maintained by the
+canonical function definitions described [below](#canonical-definitions). The
+uniqueness and parent conditions mentioned above are enforced at runtime by
+the Component Model through these canonical definitions. The `typeidx`
+immediate of a handle type must refer to a `resource` type (described below)
+that statically classifies the particular kinds of resources the handle can
+point to. See the [HTTP example](examples/HTTPAndHandles.md) for a
+demonstration of how all the variations of these handle types arise in the
+context of HTTP.
 
 The [subtyping] between all these types is described in a separate
 [subtyping explainer](Subtyping.md). Of note here, though: the optional
@@ -1071,6 +1076,7 @@ canonopt ::= string-encoding=utf8
            | (memory <core:memidx>)
            | (realloc <core:funcidx>)
            | (post-return <core:funcidx>)
+           | dedupe
 ```
 While the production `externdesc` accepts any `sort`, the validation rules
 for `canon lift` would only allow the `func` sort. In the future, other sorts
@@ -1108,6 +1114,18 @@ after they have finished being read, allowing memory to be deallocated and
 destructors called. This immediate is always optional but, if present, is
 validated to have parameters matching the callee's return type and empty
 results.
+
+The `dedupe` option applies to lowered `ref` handles. Because `ref` handles
+are not necessarily unique, a component can be given multple handles to the
+same underlying resource over time. The `dedupe` option specifies that
+handles are deduplicated per component instance. When a duplicate handle is
+lowered, the `i32` index of the existing handle is returned instead,
+performing no modification of the handle table. The deduplicated
+`i32` index can thus be used to compare for component-local equality or
+assign unique object wrappers as is done, e.g., on the Web for C++ DOM
+objects exposed to JS. When a `parent` is specified for the `ref` handle,
+duplication is performed keyed on the parent, since different parents have
+different handle lifetime requirements.
 
 Based on this description of the AST, the [Canonical ABI explainer][Canonical
 ABI] gives a detailed walkthrough of the static and dynamic semantics of `lift`
@@ -1188,39 +1206,51 @@ dynamically interact with Canonical ABI entities like resources (and, when
 async is added to the proposal, [tasks][Future and Stream Types]).
 ```
 canon ::= ...
-        | (canon own.new <typeidx> (core func <id>?))
-        | (canon own.drop <typeidx> (core func <id>?))
-        | (canon borrow.drop <typeidx> (core func <id>?))
+        | (canon own.new <valtype> (core func <id>?))
+        | (canon ref.new <valtype> dedupe? (core func <id>?))
+        | (canon own.drop <valtype> (core func <id>?))
+        | (canon ref.drop <valtype> (core func <id>?))
+        | (canon borrow.drop <valtype> (core func <id>?))
         | (canon handle.rep <typeidx> (core func <id>?))
+        | (canon ref.from-own <typeidx> dedupe? (core func <id>?))
 ```
-The `own.new` built-in requires that the given `typeidx` refers to a `resource`
-`deftype` (a resource defined within this component). The parameters to
-`own.new` match the `(rep <valtype>)` immediate of the resource type. The
-return value of `own.new` is an `i32` index referring to an `own` handle in the
-current component instance's handle table. Because resource type
-representations are currently fixed to be `i32`, the core function signature of
-`own.new` is currently always `[i32] -> [i32]`.
+The `new` built-ins require that the given `typeidx` refers to a `resource`
+`deftype` (a resource defined within this component). The parameters to these
+built-in functions are derived from the `(rep <valtype>)` immediate of the
+resource type. The return value is an `i32` index referring to an `own` or
+`ref` handle in the current component instance's handle table. Because resource
+type representations are currently fixed to be `i32`, the core function
+signature of `own.new` and `ref.new` is thus always `[i32] -> [i32]`.
 
-The `own.drop` and `borrow.drop` built-ins have core function signature `[i32]
--> []` and drop the handle at the given index from the handle table. The
-`typeidx` immediate specifies the resource type of the handle being dropped.
-If `own`, the resource type's `dtor` function is called synchronously, if
-present.
+The 5 `drop` built-ins have core function signature `[i32] -> []` and drop the
+handle at the given index. The `typeidx` immediate specifies the resource type
+of the handle being dropped. If the last handle to a resource is dropped, the
+resource type's `dtor` function is called synchronously, if present.
 
-In-between `new` and `drop`, `own` handles can be passed between components via
-import and export calls using `own` and `borrow` handle types in parameters and
-results. The Canonical ABI specifies that `own` handles are *transferred* from
-the producer component instance's handle table into the consumer component
-instance's handle table. In contrast, `borrow` handles are *copied* into the
-callee component instance's handle table, but with runtime (trapping) guards to
-ensure that the callee calls `borrow.drop` on the borrowed handle before the
-end of the call and that the owner of the resource does not destroy the
-resource for the duration of the call.
+In-between `new` and `drop`, handles can be passed between components via
+import and export calls. The Canonical ABI specifies that `own` handles are
+*transferred* from the producer component instance's handle table into the
+consumer component instance's handle table. All other handle types are *copied*
+across the component boundary. Additional rules are enforced using runtime
+traps:
+* `borrow` handles must be dropped before the end of the call by the callee.
+* No handle may be dropped while it has been lent out to an export call.
+* `own` and `ref` handles with `parent`s are dropped before the parent handle
+  has been dropped.
 
-Lastly, given the `i32` index of an `own` or `borrow` handle, the component
+Given the `i32` index of an `own` or `borrow` handle, the component
 that defined a resource type (and only that component) can call the
 `handle.rep` built-in to access the `rep` value. Because of the fixed
 `(rep i32)`, the core signature of `handle.rep` is `[i32] -> [i32]`.
+As a special-case optimization, when a component is passed a `borrow` handle
+for a resource that it itself implements, `handle.rep` is preemptively applied
+at lowering time so that the given `i32` value is the `rep`, not the usual
+index to a `borrow` handle (see `lower_borrow` in `CanonicalABI.md`).
+
+The `ref.from-own` built-in converts a handle in-place from `own` to `ref`,
+allowing the owner of a resource to dynamically switch from unique to
+reference-counted ownership. The optional `dedupe` immediate indicates
+whether this handle should be deduplicated against future lowered handles.
 
 As an example, the following component imports the `own.new` built-in,
 allowing it to create and return new resources to its client:

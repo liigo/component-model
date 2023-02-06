@@ -203,8 +203,9 @@ defvaltype    ::= pvt:<primvaltype>                       => pvt
                 | 0x6c t*:vec(<valtype>)                  => (union t*)
                 | 0x6b t:<valtype>                        => (option t)
                 | 0x6a t?:<valtype>? u?:<valtype>?        => (result t? (error u)?)
-                | 0x69 i:<typeidx>                        => (own i)
-                | 0x68 i:<typeidx>                        => (borrow i)
+                | 0x69 i:<typeidx> parent?:<label>?       => (own i parent?)
+                | 0x68 i:<typeidx> parent?:<label>?       => (ref i parent?)
+                | 0x67 i:<typeidx>                        => (borrow i)
 labelvaltype  ::= l:<label> t:<valtype>                   => l t
 case          ::= l:<label> t?:<valtype>? r?:<u32>?       => (case l t? (refines case-label[r])?)
 <T>?          ::= 0x00                                    =>
@@ -240,12 +241,12 @@ Notes:
   with type opcodes starting at SLEB128(-1) (`0x7f`) and going down,
   reserving the nonnegative SLEB128s for type indices.
 * Validation of `valtype` requires the `typeidx` to refer to a `defvaltype`.
-* Validation of `own` and `borrow` requires the `typeidx` to refer to a
+* Validation of `own`, `ref` and `borrow` requires the `typeidx` to refer to a
   resource type.
-* Validation only allows `borrow` to be used inside the `param` of a `functype`.
-  (This is likely to change in a future PR, converting `functype` into a
-  compound type constructor analogous to `moduletype` and `componenttype` and
-  using scoping to enforce this constraint instead.)
+* When validating a function type, validation only allows `borrow` to be used
+  inside a `param` and handles with `parent` to only occur inside a `result`.
+  Lastly, the `parent` label is validated to match a `param` with `borrow`
+  type.
 * Validation of `resourcetype` requires the destructor (if present) to have
   type `[i32] -> []`.
 * Validation of `instancedecl` (currently) only allows the `type` and
@@ -281,9 +282,13 @@ Notes:
 canon    ::= 0x00 0x00 f:<core:funcidx> opts:<opts> ft:<typeidx> => (canon lift f opts type-index-space[ft])
            | 0x01 0x00 f:<funcidx> opts:<opts>                   => (canon lower f opts (core func))
            | 0x02 rt:<typeidx>                                   => (canon own.new rt (core func))
-           | 0x03 rt:<typeidx>                                   => (canon own.drop rt (core func))
-           | 0x04 rt:<typeidx>                                   => (canon borrow.drop rt (core func))
-           | 0x05 rt:<typeidx>                                   => (canon handle.rep rt (core func))
+           | 0x03 rt:<typeidx> d?:<dedupe>?                      => (canon ref.new rt d? (core func))
+           | 0x04 rt:<typeidx>                                   => (canon own.drop rt (core func))
+           | 0x05 rt:<typeidx>                                   => (canon ref.drop t (core func))
+           | 0x06 rt:<typeidx>                                   => (canon borrow.drop rt (core func))
+           | 0x07 rt:<typeidx>                                   => (canon handle.rep rt (core func))
+           | 0x08 rt:<typeidx> d?:<dedupe>?                      => (canon ref.from-own rt d? (core func))
+dedupe   ::=                                                     => dedupe
 opts     ::= opt*:vec(<canonopt>)                                => opt*
 canonopt ::= 0x00                                                => string-encoding=utf8
            | 0x01                                                => string-encoding=utf16
@@ -291,6 +296,7 @@ canonopt ::= 0x00                                                => string-encod
            | 0x03 m:<core:memidx>                                => (memory m)
            | 0x04 f:<core:funcidx>                               => (realloc f)
            | 0x05 f:<core:funcidx>                               => (post-return f)
+           | 0x06                                                => dedupe
 ```
 Notes:
 * The second `0x00` byte in `canon` stands for the `func` sort and thus the

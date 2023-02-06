@@ -32,12 +32,13 @@ class Heap:
     self.memory[ret : ret + original_size] = self.memory[original_ptr : original_ptr + original_size]
     return ret
 
-def mk_opts(memory = bytearray(), encoding = 'utf8', realloc = None, post_return = None):
+def mk_opts(memory = bytearray(), encoding = 'utf8', realloc = None, post_return = None, dedupe = False):
   opts = CanonicalOptions()
   opts.memory = memory
   opts.string_encoding = encoding
   opts.realloc = realloc
   opts.post_return = post_return
+  opts.dedupe = dedupe
   return opts
 
 def mk_cx(memory = bytearray(), encoding = 'utf8', realloc = None, post_return = None):
@@ -375,7 +376,7 @@ test_roundtrip(List(String()), [mk_str("hello there")])
 test_roundtrip(List(List(String())), [[mk_str("one"),mk_str("two")],[mk_str("three")]])
 test_roundtrip(List(Option(Tuple([String(),U16()]))), [{'some':mk_tup(mk_str("answer"),42)}])
 
-def test_handles():
+def test_own_handles():
   before = definitions.MAX_FLAT_RESULTS
   definitions.MAX_FLAT_RESULTS = 16
 
@@ -394,56 +395,89 @@ def test_handles():
     assert(len(args) == 2)
     assert(args[0].rep == 42)
     assert(args[1].rep == 44)
-    return ([OwnHandle(45, 0)], lambda:())
+    return ([
+      OwnHandle(45, 0),
+      OwnHandle(60, 0, None),
+      OwnHandle(61, 0, None)
+    ], lambda:())
+
+  def host_import2(args):
+    assert(len(args) == 1)
+    assert(args[0].rep == 61)
+    return ([OwnHandle(62, 0, None)], lambda:())
 
   def core_wasm(args):
     nonlocal dtor_value
 
     assert(len(args) == 4)
     assert(args[0].t == 'i32' and args[0].v == 0)
-    assert(args[1].t == 'i32' and args[1].v == 1)
-    assert(args[2].t == 'i32' and args[2].v == 2)
-    assert(args[3].t == 'i32' and args[3].v == 13)
     assert(canon_handle_rep(inst, rt, 0) == 42)
+    assert(args[1].t == 'i32' and args[1].v == 1)
+    assert(canon_handle_rep(inst, rt, 0) == 42)
+    assert(args[2].t == 'i32' and args[2].v == 2)
     assert(canon_handle_rep(inst, rt, 1) == 43)
+    assert(args[3].t == 'i32' and args[3].v == 13)
     assert(canon_handle_rep(inst, rt, 2) == 44)
 
     host_ft = FuncType([
       Borrow(rt),
       Borrow(rt)
     ],[
-      Own(rt)
+      Own(rt),
+      Own(rt,0),
+      Own(rt,1)
     ])
     args = [
       Value('i32',0),
       Value('i32',2)
     ]
     results = canon_lower(opts, inst, host_import, True, host_ft, args)
-    assert(len(results) == 1)
+    assert(len(results) == 3)
     assert(results[0].t == 'i32' and results[0].v == 3)
     assert(canon_handle_rep(inst, rt, 3) == 45)
+
+    assert(results[1].t == 'i32' and results[1].v == 4)
+    assert(canon_handle_rep(inst, rt, 4) == 60)
+    assert(inst.handles.get(0, rt).lend_count == 1)
+    canon_own_drop(inst, rt, 4)
+    assert(inst.handles.get(0, rt).lend_count == 0)
+
+    assert(results[2].t == 'i32' and results[2].v == 5)
+    assert(canon_handle_rep(inst, rt, 5) == 61)
+    assert(inst.handles.get(2, rt).lend_count == 1)
+
+    host_ft2 = FuncType([Borrow(rt)],[Own(rt,0)])
+    args2 = [Value('i32',5)]
+    results2 = canon_lower(opts, inst, host_import2, True, host_ft2, args2)
+    assert(len(results2) == 1)
+    assert(results2[0].t == 'i32' and results2[0].v == 4)
+    assert(inst.handles.get(2, rt).lend_count == 2)
+    canon_own_drop(inst, rt, 4)
+    assert(inst.handles.get(2, rt).lend_count == 1)
 
     dtor_value = None
     canon_own_drop(inst, rt, 0)
     assert(dtor_value == 42)
-    assert(len(inst.handles.table(rt).array) == 4)
+    assert(len(inst.handles.table(rt).array) == 6)
     assert(inst.handles.table(rt).array[0] is None)
-    assert(len(inst.handles.table(rt).free) == 1)
+    assert(len(inst.handles.table(rt).free) == 2)
 
     h = canon_own_new(inst, rt, 46)
     assert(h == 0)
-    assert(len(inst.handles.table(rt).array) == 4)
+    assert(len(inst.handles.table(rt).array) == 6)
     assert(inst.handles.table(rt).array[0] is not None)
-    assert(len(inst.handles.table(rt).free) == 0)
-
-    dtor_value = None
-    canon_borrow_drop(inst, rt, 2)
-    assert(dtor_value is None)
-    assert(len(inst.handles.table(rt).array) == 4)
-    assert(inst.handles.table(rt).array[2] is None)
     assert(len(inst.handles.table(rt).free) == 1)
 
-    return [Value('i32', 0), Value('i32', 1), Value('i32', 3)]
+    return [
+      Value('i32', 0),
+      Value('i32', 1),
+      Value('i32', 3),
+      Value('i32', 5)
+    ]
+
+  def post_return(_):
+    canon_borrow_drop(inst, rt, 2)
+  opts.post_return = post_return
 
   ft = FuncType([
     Own(rt),
@@ -453,25 +487,152 @@ def test_handles():
   ],[
     Own(rt),
     Own(rt),
-    Own(rt)
+    Own(rt,2),
+    Own(rt,2)
   ])
   args = [
     OwnHandle(42, 0),
     OwnHandle(43, 0),
-    BorrowHandle(44, 0, None),
-    BorrowHandle(13, 0, None)
+    BorrowHandle(44, 0, OwnHandle(44, 0), None),
+    BorrowHandle(13, 0, OwnHandle(13, 0), None),
   ]
   got,post_return = canon_lift(opts, inst, core_wasm, ft, args)
 
-  assert(len(got) == 3)
+  assert(len(got) == 4)
   assert(got[0].rep == 46)
   assert(got[1].rep == 43)
   assert(got[2].rep == 45)
-  assert(len(inst.handles.table(rt).array) == 4)
+  assert(got[3].rep == 61)
+  assert(len(inst.handles.table(rt).array) == 6)
+  post_return()
   assert(all(inst.handles.table(rt).array[i] is None for i in range(3)))
-  assert(len(inst.handles.table(rt).free) == 4)
+  assert(len(inst.handles.table(rt).free) == 6)
   definitions.MAX_FLAT_RESULTS = before
 
-test_handles()
+test_own_handles()
+
+def test_ref_handles():
+  before = definitions.MAX_FLAT_RESULTS
+  definitions.MAX_FLAT_RESULTS = 16
+
+  dtor_value = None
+  def dtor(x):
+    nonlocal dtor_value
+    dtor_value = x
+
+  rt = ResourceType(ComponentInstance(), dtor)
+
+  inst = ComponentInstance()
+  opts = mk_opts(dedupe = True)
+
+  def host_import(args):
+    assert(len(args) == 2)
+    assert(args[0].rep == 42)
+    assert(args[1].rep == 43)
+    return ([
+      RefHandle(42, 0, args[1].ref, None),
+      RefHandle(43, 0, args[1].ref, None, None),
+      RefHandle(43, 0, args[1].ref, None, None),
+      OwnHandle(44, 0, None)
+    ], lambda:())
+
+  def core_wasm(args):
+    nonlocal dtor_value
+
+    assert(len(args) == 2)
+    assert(args[0].t == 'i32' and args[0].v == 0)
+    assert(canon_handle_rep(inst, rt, 0) == 42)
+    assert(args[1].t == 'i32' and args[1].v == 1)
+    assert(canon_handle_rep(inst, rt, 1) == 43)
+
+    r = inst.handles.get(1, rt)
+    assert(r.ref.ct == 2)
+
+    host_ft = FuncType([
+      Borrow(rt),
+      Ref(rt)
+    ],[
+      Ref(rt),
+      Ref(rt,0),
+      Ref(rt,0),
+      Own(rt,0)
+    ])
+    args = [
+      Value('i32',0),
+      Value('i32',1)
+    ]
+    results = canon_lower(opts, inst, host_import, True, host_ft, args)
+    assert(len(results) == 4)
+    assert(results[0].t == 'i32' and results[0].v == 1)
+    assert(results[1].t == 'i32' and results[1].v == 2)
+    assert(results[2].t == 'i32' and results[2].v == 2)
+    assert(results[3].t == 'i32' and results[3].v == 3)
+
+    assert(r.ref.ct == 3)
+    canon_ref_drop(inst, rt, 1)
+    assert(r.ref.ct == 2)
+
+    i = canon_own_new(inst, rt, 45)
+    assert(i == 1)
+    canon_ref_from_own(inst, rt, False, 1)
+    assert(inst.handles.get(1, rt).ref.ct == 1)
+    dtor_value = None
+    canon_ref_drop(inst, rt, 1)
+    assert(dtor_value == 45)
+
+    canon_ref_from_own(inst, rt, False, 3)
+
+    i = canon_ref_new(inst, rt, False, 45)
+    assert(i == 1)
+
+    assert(inst.handles.get(0, rt).lend_count == 2)
+
+    return [
+      Value('i32', 1),
+      Value('i32', 2),
+      Value('i32', 3)
+    ]
+
+  def post_return(_):
+    assert(inst.handles.get(0, rt).lend_count == 2)
+    canon_ref_drop(inst, rt, 3)
+    assert(inst.handles.get(0, rt).lend_count == 1)
+    canon_ref_drop(inst, rt, 2)
+    assert(inst.handles.get(0, rt).lend_count == 0)
+    canon_ref_drop(inst, rt, 1)
+    canon_borrow_drop(inst, rt, 0)
+  opts.post_return = post_return
+
+  ft = FuncType([
+    Borrow(rt),
+    Ref(rt)
+  ],[
+    Ref(rt, 0),
+    Ref(rt, 0),
+    Ref(rt, 0)
+  ])
+  args = [
+    BorrowHandle(42, 0, OwnHandle(99, 0), None),
+    RefHandle(43, 0, RefCountCell(1), None)
+  ]
+  got,post_return = canon_lift(opts, inst, core_wasm, ft, args)
+  post_return()
+
+  assert(args[1].ref.ct == 1)
+  assert(len(got) == 3)
+  assert(got[0].rep == 45)
+  assert(got[0].ref.ct == 0)
+  assert(got[1].rep == 43)
+  assert(got[1].ref is args[1].ref)
+  assert(got[2].rep == 44)
+  assert(got[2].ref.ct == 0)
+  rtable = inst.handles.table(rt)
+  assert(len(rtable.deduped) == 0)
+  assert(len(inst.handles.table(rt).array) == 4)
+  assert(len(inst.handles.table(rt).free) == 4)
+
+  definitions.MAX_FLAT_RESULTS = before
+
+test_ref_handles()
 
 print("All tests passed")

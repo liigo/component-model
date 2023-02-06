@@ -980,27 +980,39 @@ loan of a handle from the caller to the callee for the duration of the call.
 The syntax for handles is:
 ```ebnf
 handle ::= id
+         | 'ref' '<' id '>'
          | 'borrow' '<' id '>'
+         | 'child' id ( 'of' id )?
+         | 'child' 'ref' '<' id '>' ( 'of' id )?
 ```
 
-The `id` case denotes an owned handle, where `id` is the name of a preceding
-`resource` item. Thus, the "default" way that resources are passed between
-components is via transfer of unique ownership.
+The `id` case translates to the component handle type `(own id)`, where `id`
+must resolve to a resource type. The `ref<id>` and `borrow<id>` cases translate
+to `(ref id)` and `(borrow id)`, respectively. Thus, `own` has the role of the
+default handle type.
+
+The `child id1 of id2` and `child ref<id1> of id2` cases translate to the
+handle types `(own id1 id2)` and `(ref id1 id2)`, respectively, where `id1`
+must resolve to a resource type and `id2` must resolve the a parameter name in
+the enclosing function signature. If the `of id2` clause is absent, the default
+parameter name is `self`.
 
 The resource method syntax defined above is syntactic sugar that expands into
 separate function items that take a first parameter named `self` of type
 `borrow`. For example, the compound definition:
 ```
 resource file {
-    read: func(n: u32) -> list<u8>
+    read-sync: func(n: u32) -> list<u8>
+    read-async: func(n: u32) -> child input-stream
 }
 ```
-is expanded into:
+is equivalent to:
 ```
 resource file
-%[method]file.read: func(self: borrow<file>, n: u32) -> list<u8>
+%[method]file.read-sync: func(self: borrow<file>, n: u32) -> list<u8>
+%[method]file.read-async: func(self: borrow<file>, n: u32) -> child input-stream of self
 ```
-where `%[method]file.read` is the desugared name of a method according to the
+where `%[method]file.read-sync` is the desugared name of a method according to the
 Component Model's definition of [`name`](Explainer.md).
 
 
