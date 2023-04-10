@@ -160,12 +160,11 @@ class Flags(ValType):
   labels: [str]
 
 @dataclass
-class Own(ValType):
+class HandleType(ValType):
   rt: ResourceType
 
-@dataclass
-class Borrow(ValType):
-  rt: ResourceType
+class Own(HandleType): pass
+class Borrow(HandleType): pass
 
 ### Despecialization
 
@@ -194,7 +193,7 @@ def alignment(t):
     case Record(fields)     : return alignment_record(fields)
     case Variant(cases)     : return alignment_variant(cases)
     case Flags(labels)      : return alignment_flags(labels)
-    case Own(_) | Borrow(_) : return 4
+    case HandleType()       : return 4
 
 #
 
@@ -249,7 +248,7 @@ def size(t):
     case Record(fields)     : return size_record(fields)
     case Variant(cases)     : return size_variant(cases)
     case Flags(labels)      : return size_flags(labels)
-    case Own(_) | Borrow(_) : return 4
+    case HandleType()       : return 4
 
 def size_record(fields):
   s = 0
@@ -286,7 +285,7 @@ def num_i32_flags(labels):
 class Context:
   opts: CanonicalOptions
   inst: ComponentInstance
-  lenders: [Handle]
+  lenders: [HandleBase]
   borrow_count: int
 
   def __init__(self, opts, inst):
@@ -325,22 +324,29 @@ class ResourceType(Type):
 #
 
 @dataclass
-class Handle:
+class HandleBase:
   rep: int
   lend_count: int
 
-@dataclass
-class OwnHandle(Handle):
-  pass
+  def destroy(self, rt: ResourceType):
+    trap_if(not rt.impl.may_enter)
+    if rt.dtor:
+      rt.dtor(self.rep)
 
 @dataclass
-class BorrowHandle(Handle):
+class OwnHandle(HandleBase):
+  pass
+
+#
+
+@dataclass
+class BorrowHandle(HandleBase):
   cx: Optional[Context]
 
 #
 
 class HandleTable:
-  array: [Optional[Handle]]
+  array: [Optional[HandleBase]]
   free: [int]
 
   def __init__(self):
@@ -374,16 +380,12 @@ class HandleTable:
     trap_if(h.lend_count != 0)
     match vt:
       case 'own':
-        trap_if(not isinstance(h, OwnHandle))
-        if drop and rt.dtor:
-          trap_if(not rt.impl.may_enter)
-          rt.dtor(h.rep)
+        if drop:
+          h.destroy(rt)
       case 'borrow':
-        trap_if(not isinstance(h, BorrowHandle))
         h.cx.borrow_count -= 1
     self.array[i] = None
     self.free.append(i)
-    return h
 
 #
 
@@ -403,7 +405,7 @@ class HandleTables:
   def get(self, i, rt):
     return self.table(rt).get(i)
   def transfer(self, i, vt, rt):
-    return self.table(rt).transfer_or_drop(i, vt, rt, drop = False)
+    self.table(rt).transfer_or_drop(i, vt, rt, drop = False)
   def drop(self, i, vt, rt):
     self.table(rt).transfer_or_drop(i, vt, rt, drop = True)
 
@@ -576,7 +578,10 @@ def unpack_flags_from_int(i, labels):
 #
 
 def lift_own(cx, i, t):
-  return cx.inst.handles.transfer(i, 'own', t.rt)
+  h = cx.inst.handles.get(i, t.rt)
+  trap_if(not isinstance(h, OwnHandle))
+  cx.inst.handles.transfer(i, 'own', t.rt)
+  return OwnHandle(h.rep, 0)
 
 #
 
@@ -897,7 +902,7 @@ def flatten_type(t):
     case Record(fields)       : return flatten_record(fields)
     case Variant(cases)       : return flatten_variant(cases)
     case Flags(labels)        : return ['i32'] * num_i32_flags(labels)
-    case Own(_) | Borrow(_)   : return ['i32']
+    case HandleType()         : return ['i32']
 
 #
 
@@ -1219,9 +1224,13 @@ def canon_own_new(inst, rt, rep):
 ### `canon *.drop`
 
 def canon_own_drop(inst, rt, i):
+  h = inst.handles.get(i, rt)
+  trap_if(not isinstance(h, OwnHandle))
   inst.handles.drop(i, 'own', rt)
 
 def canon_borrow_drop(inst, rt, i):
+  h = inst.handles.get(i, rt)
+  trap_if(not isinstance(h, BorrowHandle))
   inst.handles.drop(i, 'borrow', rt)
 
 ### `canon handle.rep`

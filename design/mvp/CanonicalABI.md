@@ -104,7 +104,7 @@ def alignment(t):
     case Record(fields)     : return alignment_record(fields)
     case Variant(cases)     : return alignment_variant(cases)
     case Flags(labels)      : return alignment_flags(labels)
-    case Own(_) | Borrow(_) : return 4
+    case HandleType()       : return 4
 ```
 
 Record alignment is tuple alignment, with the definitions split for reuse below:
@@ -176,7 +176,7 @@ def size(t):
     case Record(fields)     : return size_record(fields)
     case Variant(cases)     : return size_variant(cases)
     case Flags(labels)      : return size_flags(labels)
-    case Own(_) | Borrow(_) : return 4
+    case HandleType()       : return 4
 
 def size_record(fields):
   s = 0
@@ -218,7 +218,7 @@ definitions via the `cx` parameter:
 class Context:
   opts: CanonicalOptions
   inst: ComponentInstance
-  lenders: [Handle]
+  lenders: [HandleBase]
   borrow_count: int
 
   def __init__(self, opts, inst):
@@ -278,29 +278,35 @@ class ResourceType(Type):
   dtor: Optional[Callable[[int],None]]
 ```
 
-The `Handle` class and its subclasses represent handle values referring to
-resources. The `rep` field of `Handle` stores the representation value
+The `HandleBase` class and its subclasses represent handle values referring to
+resources. The `rep` field of `HandleBase` stores the representation value
 (currently fixed to `i32`) pass to `resource.new` for the resource that this
 handle refers to.
 ```python
 @dataclass
-class Handle:
+class HandleBase:
   rep: int
   lend_count: int
 
-@dataclass
-class OwnHandle(Handle):
-  pass
+  def destroy(self, rt: ResourceType):
+    trap_if(not rt.impl.may_enter)
+    if rt.dtor:
+      rt.dtor(self.rep)
 
 @dataclass
-class BorrowHandle(Handle):
-  cx: Optional[Context]
+class OwnHandle(HandleBase):
+  pass
 ```
 The `lend_count` field maintains a count of the outstanding handles that were
 lent from this handle (by calls to `borrow`-taking functions). This count is
 used below to dynamically enforce the invariant that a handle cannot be
 dropped while it has currently lent out a `borrow`.
 
+```python
+@dataclass
+class BorrowHandle(HandleBase):
+  cx: Optional[Context]
+```
 The `BorrowHandle` class additionally stores the `Context` of the call that
 created this borrow for the purposes of `borrow_count` bookkeeping below.
 Until async is added to the Component Model, because of the non-reentrancy
@@ -312,7 +318,7 @@ of handles that all share the same `ResourceType`. Defining `HandleTable` in
 chunks, we start with the fields and `add` method:
 ```python
 class HandleTable:
-  array: [Optional[Handle]]
+  array: [Optional[HandleBase]]
   free: [int]
 
   def __init__(self):
@@ -351,23 +357,19 @@ use-after-free:
 
 The last method of `HandleTable`, `transfer_or_drop`, is used to transfer or
 drop a handle out of the handle table. `transfer_or_drop` adds the removed
-handle to the `free` list for later recycling by `add` (above).
+table element to the `free` list for later recycling by `add` (above).
 ```python
   def transfer_or_drop(self, i, vt, rt, drop):
     h = self.get(i)
     trap_if(h.lend_count != 0)
     match vt:
       case 'own':
-        trap_if(not isinstance(h, OwnHandle))
-        if drop and rt.dtor:
-          trap_if(not rt.impl.may_enter)
-          rt.dtor(h.rep)
+        if drop:
+          h.destroy(rt)
       case 'borrow':
-        trap_if(not isinstance(h, BorrowHandle))
         h.cx.borrow_count -= 1
     self.array[i] = None
     self.free.append(i)
-    return h
 ```
 The `lend_count` guard ensures that no dangling borrows are created when
 destroying a resource. The bookkeeping performed for borrowed handles records
@@ -393,7 +395,7 @@ class HandleTables:
   def get(self, i, rt):
     return self.table(rt).get(i)
   def transfer(self, i, vt, rt):
-    return self.table(rt).transfer_or_drop(i, vt, rt, drop = False)
+    self.table(rt).transfer_or_drop(i, vt, rt, drop = False)
   def drop(self, i, vt, rt):
     self.table(rt).transfer_or_drop(i, vt, rt, drop = True)
 ```
@@ -618,7 +620,10 @@ instance's handle table. This ensures that `own` handles are always uniquely
 referenced.
 ```python
 def lift_own(cx, i, t):
-  return cx.inst.handles.transfer(i, 'own', t.rt)
+  h = cx.inst.handles.get(i, t.rt)
+  trap_if(not isinstance(h, OwnHandle))
+  cx.inst.handles.transfer(i, 'own', t.rt)
+  return OwnHandle(h.rep, 0)
 ```
 
 Lastly, `borrow` handles are lifted by handing out a `BorrowHandle` storing the
@@ -1061,7 +1066,7 @@ def flatten_type(t):
     case Record(fields)       : return flatten_record(fields)
     case Variant(cases)       : return flatten_variant(cases)
     case Flags(labels)        : return ['i32'] * num_i32_flags(labels)
-    case Own(_) | Borrow(_)   : return ['i32']
+    case HandleType()         : return ['i32']
 ```
 
 Record flattening simply flattens each field in sequence.
@@ -1578,9 +1583,13 @@ validation specifies:
 Calling `$f` invokes one of the following functions:
 ```python
 def canon_own_drop(inst, rt, i):
+  h = inst.handles.get(i, rt)
+  trap_if(not isinstance(h, OwnHandle))
   inst.handles.drop(i, 'own', rt)
 
 def canon_borrow_drop(inst, rt, i):
+  h = inst.handles.get(i, rt)
+  trap_if(not isinstance(h, BorrowHandle))
   inst.handles.drop(i, 'borrow', rt)
 ```
 
