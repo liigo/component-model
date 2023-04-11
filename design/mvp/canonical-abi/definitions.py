@@ -347,7 +347,7 @@ class HandleTable:
     self.array = []
     self.free = []
 
-  def add(self, h, t):
+  def add(self, h, vt):
     if self.free:
       i = self.free.pop()
       assert(self.array[i] is None)
@@ -355,8 +355,8 @@ class HandleTable:
     else:
       i = len(self.array)
       self.array.append(h)
-    match t:
-      case Borrow():
+    match vt:
+      case 'borrow':
         h.cx.borrow_count += 1
     return i
 
@@ -369,16 +369,16 @@ class HandleTable:
 
 #
 
-  def transfer_or_drop(self, i, t, drop):
+  def transfer_or_drop(self, i, vt, rt, drop):
     h = self.get(i)
     trap_if(h.lend_count != 0)
-    match t:
-      case Own():
+    match vt:
+      case 'own':
         trap_if(not isinstance(h, OwnHandle))
-        if drop and t.rt.dtor:
-          trap_if(not t.rt.impl.may_enter)
-          t.rt.dtor(h.rep)
-      case Borrow():
+        if drop and rt.dtor:
+          trap_if(not rt.impl.may_enter)
+          rt.dtor(h.rep)
+      case 'borrow':
         trap_if(not isinstance(h, BorrowHandle))
         h.cx.borrow_count -= 1
     self.array[i] = None
@@ -398,14 +398,14 @@ class HandleTables:
       self.rt_to_table[id(rt)] = HandleTable()
     return self.rt_to_table[id(rt)]
 
-  def add(self, h, t):
-    return self.table(t.rt).add(h, t)
+  def add(self, h, vt, rt):
+    return self.table(rt).add(h, vt)
   def get(self, i, rt):
     return self.table(rt).get(i)
-  def transfer(self, i, t):
-    return self.table(t.rt).transfer_or_drop(i, t, drop = False)
-  def drop(self, i, t):
-    self.table(t.rt).transfer_or_drop(i, t, drop = True)
+  def transfer(self, i, vt, rt):
+    return self.table(rt).transfer_or_drop(i, vt, rt, drop = False)
+  def drop(self, i, vt, rt):
+    self.table(rt).transfer_or_drop(i, vt, rt, drop = True)
 
 ### Loading
 
@@ -576,7 +576,7 @@ def unpack_flags_from_int(i, labels):
 #
 
 def lift_own(cx, i, t):
-  return cx.inst.handles.transfer(i, t)
+  return cx.inst.handles.transfer(i, 'own', t.rt)
 
 #
 
@@ -849,14 +849,14 @@ def pack_flags_into_int(v, labels):
 
 def lower_own(cx, h, t):
   assert(isinstance(h, OwnHandle))
-  return cx.inst.handles.add(h, t)
+  return cx.inst.handles.add(h, 'own', t.rt)
 
 def lower_borrow(cx, h, t):
   assert(isinstance(h, BorrowHandle))
   if cx.inst is t.rt.impl:
     return h.rep
   h.cx = cx
-  return cx.inst.handles.add(h, t)
+  return cx.inst.handles.add(h, 'borrow', t.rt)
 
 ### Flattening
 
@@ -1156,7 +1156,7 @@ def lower_values(cx, max_flat, vs, ts, out_param = None):
       flat_vals += lower_flat(cx, vs[i], ts[i])
     return flat_vals
 
-### `lift`
+### `canon lift`
 
 def canon_lift(opts, inst, callee, ft, args):
   cx = Context(opts, inst)
@@ -1181,7 +1181,7 @@ def canon_lift(opts, inst, callee, ft, args):
 
   return (results, post_return)
 
-### `lower`
+### `canon lower`
 
 def canon_lower(opts, inst, callee, calling_import, ft, flat_args):
   cx = Context(opts, inst)
@@ -1210,19 +1210,22 @@ def canon_lower(opts, inst, callee, calling_import, ft, flat_args):
 
   return flat_results
 
-### `resource.new`
+### `canon *.new`
 
-def canon_resource_new(inst, rt, rep):
+def canon_own_new(inst, rt, rep):
   h = OwnHandle(rep, 0)
-  return inst.handles.add(h, Own(rt))
+  return inst.handles.add(h, 'own', rt)
 
-### `resource.drop`
+### `canon *.drop`
 
-def canon_resource_drop(inst, t, i):
-  inst.handles.drop(i, t)
+def canon_own_drop(inst, rt, i):
+  inst.handles.drop(i, 'own', rt)
 
-### `resource.rep`
+def canon_borrow_drop(inst, rt, i):
+  inst.handles.drop(i, 'borrow', rt)
 
-def canon_resource_rep(inst, rt, i):
+### `canon handle.rep`
+
+def canon_handle_rep(inst, rt, i):
   h = inst.handles.get(i, rt)
   return h.rep

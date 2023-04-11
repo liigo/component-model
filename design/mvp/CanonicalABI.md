@@ -18,9 +18,9 @@ of modules in Core WebAssembly.
 * [Canonical definitions](#canonical-definitions)
   * [`canon lift`](#canon-lift)
   * [`canon lower`](#canon-lower)
-  * [`canon resource.new`](#canon-resourcenew)
-  * [`canon resource.drop`](#canon-resourcedrop)
-  * [`canon resource.rep`](#canon-resourcerep)
+  * [`canon *.new`](#canon-new)
+  * [`canon *.drop`](#canon-drop)
+  * [`canon handle.rep`](#canon-resourcerep)
 
 
 ## Supporting definitions
@@ -319,7 +319,7 @@ class HandleTable:
     self.array = []
     self.free = []
 
-  def add(self, h, t):
+  def add(self, h, vt):
     if self.free:
       i = self.free.pop()
       assert(self.array[i] is None)
@@ -327,8 +327,8 @@ class HandleTable:
     else:
       i = len(self.array)
       self.array.append(h)
-    match t:
-      case Borrow():
+    match vt:
+      case 'borrow':
         h.cx.borrow_count += 1
     return i
 ```
@@ -353,16 +353,16 @@ The last method of `HandleTable`, `transfer_or_drop`, is used to transfer or
 drop a handle out of the handle table. `transfer_or_drop` adds the removed
 handle to the `free` list for later recycling by `add` (above).
 ```python
-  def transfer_or_drop(self, i, t, drop):
+  def transfer_or_drop(self, i, vt, rt, drop):
     h = self.get(i)
     trap_if(h.lend_count != 0)
-    match t:
-      case Own():
+    match vt:
+      case 'own':
         trap_if(not isinstance(h, OwnHandle))
-        if drop and t.rt.dtor:
-          trap_if(not t.rt.impl.may_enter)
-          t.rt.dtor(h.rep)
-      case Borrow():
+        if drop and rt.dtor:
+          trap_if(not rt.impl.may_enter)
+          rt.dtor(h.rep)
+      case 'borrow':
         trap_if(not isinstance(h, BorrowHandle))
         h.cx.borrow_count -= 1
     self.array[i] = None
@@ -388,14 +388,14 @@ class HandleTables:
       self.rt_to_table[id(rt)] = HandleTable()
     return self.rt_to_table[id(rt)]
 
-  def add(self, h, t):
-    return self.table(t.rt).add(h, t)
+  def add(self, h, vt, rt):
+    return self.table(rt).add(h, vt)
   def get(self, i, rt):
     return self.table(rt).get(i)
-  def transfer(self, i, t):
-    return self.table(t.rt).transfer_or_drop(i, t, drop = False)
-  def drop(self, i, t):
-    self.table(t.rt).transfer_or_drop(i, t, drop = True)
+  def transfer(self, i, vt, rt):
+    return self.table(rt).transfer_or_drop(i, vt, rt, drop = False)
+  def drop(self, i, vt, rt):
+    self.table(rt).transfer_or_drop(i, vt, rt, drop = True)
 ```
 While this Python code performs a dynamic hash-table lookup on each handle
 table access, as we'll see below, the `rt` parameter is always statically
@@ -618,10 +618,8 @@ instance's handle table. This ensures that `own` handles are always uniquely
 referenced.
 ```python
 def lift_own(cx, i, t):
-  return cx.inst.handles.transfer(i, t)
+  return cx.inst.handles.transfer(i, 'own', t.rt)
 ```
-Note that `t` refers to an `own` type and thus `HandleTable.transfer` will, as
-shown above, ensure that the handle at index `i` is an `OwnHandle`.
 
 Lastly, `borrow` handles are lifted by handing out a `BorrowHandle` storing the
 same representation value as the lent handle. By incrementing `lend_count`,
@@ -980,14 +978,14 @@ current component instance's `HandleTable`:
 ```python
 def lower_own(cx, h, t):
   assert(isinstance(h, OwnHandle))
-  return cx.inst.handles.add(h, t)
+  return cx.inst.handles.add(h, 'own', t.rt)
 
 def lower_borrow(cx, h, t):
   assert(isinstance(h, BorrowHandle))
   if cx.inst is t.rt.impl:
     return h.rep
   h.cx = cx
-  return cx.inst.handles.add(h, t)
+  return cx.inst.handles.add(h, 'borrow', t.rt)
 ```
 The special case in `lower_borrow` is an optimization, recognizing that, when
 a borrowed handle is passed to the component that implemented the resource
@@ -1549,65 +1547,61 @@ the AOT compiler as requiring an intermediate copy to implement the above
 `lift`-then-`lower` semantics.
 
 
-### `canon resource.new`
+### `canon *.new`
 
 For a canonical definition:
 ```
-(canon resource.new $t (core func $f))
+(canon own.new $rt (core func $f))
 ```
 validation specifies:
-* `$t` must refer to locally-defined (not imported) resource type `$rt`
-* `$f` is given type `(func (param $rt.rep) (result i32))`, where `$rt.rep` is
-  currently fixed to be `i32`.
+* `$rt` must refer to locally-defined (not imported) resource type
+* `$f` is given type `(func (param i32) (result i32))`
 
-Calling `$f` invokes the following function, which creates a resource object
-and adds it into the current instance's handle table:
+Calling `$f` invokes the following function:
 ```python
-def canon_resource_new(inst, rt, rep):
+def canon_own_new(inst, rt, rep):
   h = OwnHandle(rep, 0)
-  return inst.handles.add(h, Own(rt))
+  return inst.handles.add(h, 'own', rt)
 ```
 
-### `canon resource.drop`
+### `canon *.drop`
 
-For a canonical definition:
+For one of the following canonical definitions:
 ```
-(canon resource.drop $t (core func $f))
+(canon own.drop $rt (core func $f))
+(canon borrow.drop $rt (core func $f))
 ```
 validation specifies:
-* `$t` must refer to a handle type `(own $rt)` or `(borrow $rt)`
+* `$rt` must refer to a resource type
 * `$f` is given type `(func (param i32))`
 
-Calling `$f` invokes the following function, which removes a handle guarded to
-be of type `$t` from the handle table and then, for an `own` handle, calls the
-optional destructor.
+Calling `$f` invokes one of the following functions:
 ```python
-def canon_resource_drop(inst, t, i):
-  inst.handles.drop(i, t)
-```
-The `may_enter` guard ensures the non-reentrance [component invariant], since
-a destructor call is analogous to a call to an export.
+def canon_own_drop(inst, rt, i):
+  inst.handles.drop(i, 'own', rt)
 
-### `canon resource.rep`
+def canon_borrow_drop(inst, rt, i):
+  inst.handles.drop(i, 'borrow', rt)
+```
+
+### `canon handle.rep`
 
 For a canonical definition:
 ```
-(canon resource.rep $t (core func $f))
+(canon handle.rep $rt (core func $f))
 ```
 validation specifies:
-* `$t` must refer to a locally-defined (not imported) resource type `$rt`
-* `$f` is given type `(func (param i32) (result $rt.rep))`, where `$rt.rep` is
-  currently fixed to be `i32`.
+* `$rt` must refer to a locally-defined (not imported) resource type
+* `$f` is given type `(func (param i32) (result i32))`
 
-Calling `$f` invokes the following function, which extracts the core
-representation of the indexed handle after checking that the resource type
-matches. Note that the "locally-defined" requirement above ensures that only
-the component instance defining a resource can access its representation.
+Calling `$f` invokes the following function:
 ```python
-def canon_resource_rep(inst, rt, i):
+def canon_handle_rep(inst, rt, i):
   h = inst.handles.get(i, rt)
   return h.rep
 ```
+Note that the "locally-defined" requirement above ensures that only the
+component instance defining a resource can access its representation.
 
 
 

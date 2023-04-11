@@ -280,9 +280,10 @@ Notes:
 ```
 canon    ::= 0x00 0x00 f:<core:funcidx> opts:<opts> ft:<typeidx> => (canon lift f opts type-index-space[ft])
            | 0x01 0x00 f:<funcidx> opts:<opts>                   => (canon lower f opts (core func))
-           | 0x02 t:<typeidx>                                    => (canon resource.new t (core func))
-           | 0x03 t:<valtype>                                    => (canon resource.drop t (core func))
-           | 0x04 t:<typeidx>                                    => (canon resource.rep t (core func))
+           | 0x02 rt:<typeidx>                                   => (canon own.new rt (core func))
+           | 0x03 rt:<typeidx>                                   => (canon own.drop rt (core func))
+           | 0x04 rt:<typeidx>                                   => (canon borrow.drop rt (core func))
+           | 0x05 rt:<typeidx>                                   => (canon handle.rep rt (core func))
 opts     ::= opt*:vec(<canonopt>)                                => opt*
 canonopt ::= 0x00                                                => string-encoding=utf8
            | 0x01                                                => string-encoding=utf16
