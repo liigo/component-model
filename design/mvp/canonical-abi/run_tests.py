@@ -375,7 +375,65 @@ test_roundtrip(List(String()), [mk_str("hello there")])
 test_roundtrip(List(List(String())), [[mk_str("one"),mk_str("two")],[mk_str("three")]])
 test_roundtrip(List(Option(Tuple([String(),U16()]))), [{'some':mk_tup(mk_str("answer"),42)}])
 
-def test_handles():
+def test_lift_handle():
+  def test_pair(dst_own, dst_scope, src_own, src_scope, expect):
+    cx = mk_cx()
+    rt = ResourceType(cx.inst, None)
+    r = Resource(42)
+    src_scope_val = src_scope
+    if dst_scope == 'resource' or src_scope == 'resource':
+      parent_rt = ResourceType(cx.inst, None)
+      parent_r = Resource(13)
+      parent_h = HandleElem(parent_r, own=False, scope='call')
+      i = cx.inst.handles.add(cx.inst, parent_rt, parent_h)
+      parent_i = HandleIndex(parent_rt, i)
+      cx.param_name_to_index['a'] = parent_i
+      if src_scope == 'resource':
+        src_scope = Parent('a')
+        src_scope_val = parent_i
+      if dst_scope == 'resource':
+        dst_scope = Parent('a')
+    dst_ht = Handle(rt, dst_own, dst_scope)
+    src_h = HandleElem(r, own=src_own, scope=src_scope_val)
+    src_i = cx.inst.handles.add(cx.inst, rt, src_h)
+    try:
+      result = lift_handle(cx, src_i, dst_ht, None)
+      assert(expect == 'ok')
+      assert(result is r)
+    except Trap:
+      assert(expect == 'bad')
+
+  def test_scopes(dst_scope, src_scope, expect_override = None):
+    ownership_dst_src_cases = [
+      (True, [
+        (True, 'ok'),
+        (False, 'bad')
+      ]),
+      (False, [
+        (True, 'ok'),
+        (False, 'ok')
+      ])
+    ]
+    for dst_own,srcs in ownership_dst_src_cases:
+      for src_own,expect in srcs:
+        if expect_override is not None:
+          expect = expect_override
+        test_pair(dst_own, dst_scope, src_own, src_scope, expect)
+
+  test_scopes(None, None)
+  test_scopes(None, 'call', 'bad')
+  test_scopes(None, 'resource', 'bad')
+  test_scopes('call', None)
+  test_scopes('call', 'call')
+  test_scopes('call', 'resource')
+  test_scopes('resource', None)
+  test_scopes('resource', 'call', 'bad')
+  test_scopes('resource', 'resource')
+
+test_lift_handle()
+
+
+def test_linear_borrow():
   before = definitions.MAX_FLAT_RESULTS
   definitions.MAX_FLAT_RESULTS = 16
 
@@ -392,58 +450,96 @@ def test_handles():
 
   def host_import(args):
     assert(len(args) == 2)
-    assert(args[0] == 42)
-    assert(args[1] == 44)
-    return ([45], lambda:())
+    assert(args[0].rep == 42)
+    assert(args[1].rep == 44)
+    return ([
+      Resource(45),
+      Resource(60),
+      Resource(61)
+    ], lambda:())
+
+  def host_import2(args):
+    assert(len(args) == 1)
+    assert(args[0].rep == 61)
+    return ([Resource(62)], lambda:())
 
   def core_wasm(args):
     nonlocal dtor_value
 
     assert(len(args) == 4)
     assert(args[0].t == 'i32' and args[0].v == 0)
-    assert(args[1].t == 'i32' and args[1].v == 1)
-    assert(args[2].t == 'i32' and args[2].v == 2)
-    assert(args[3].t == 'i32' and args[3].v == 13)
     assert(canon_resource_rep(inst, rt, 0) == 42)
+    assert(args[1].t == 'i32' and args[1].v == 1)
+    assert(canon_resource_rep(inst, rt, 0) == 42)
+    assert(args[2].t == 'i32' and args[2].v == 2)
     assert(canon_resource_rep(inst, rt, 1) == 43)
+    assert(args[3].t == 'i32' and args[3].v == 13)
     assert(canon_resource_rep(inst, rt, 2) == 44)
 
     host_ft = FuncType([
       Borrow(rt),
       Borrow(rt)
     ],[
-      Own(rt)
+      Own(rt),
+      Own(rt,Parent('0')),
+      Own(rt,Parent('1'))
     ])
     args = [
       Value('i32',0),
       Value('i32',2)
     ]
+    assert(inst.handles[HandleIndex(rt, 0)].pin_count == 0)
+    assert(inst.handles[HandleIndex(rt, 2)].pin_count == 0)
     results = canon_lower(opts, inst, host_import, True, host_ft, args)
-    assert(len(results) == 1)
+    assert(len(results) == 3)
+    assert(inst.handles[HandleIndex(rt, 0)].pin_count == 1)
+    assert(inst.handles[HandleIndex(rt, 2)].pin_count == 1)
+
     assert(results[0].t == 'i32' and results[0].v == 3)
     assert(canon_resource_rep(inst, rt, 3) == 45)
+
+    assert(results[1].t == 'i32' and results[1].v == 4)
+    assert(canon_resource_rep(inst, rt, 4) == 60)
+    assert(inst.handles[HandleIndex(rt, 0)].pin_count == 1)
+    canon_resource_drop(inst, rt, 4)
+    assert(inst.handles[HandleIndex(rt, 0)].pin_count == 0)
+
+    assert(results[2].t == 'i32' and results[2].v == 5)
+    assert(canon_resource_rep(inst, rt, 5) == 61)
+    assert(inst.handles.get(rt, 2).pin_count == 1)
+
+    host_ft2 = FuncType([Borrow(rt)],[Own(rt,Parent('0'))])
+    args2 = [Value('i32',5)]
+    results2 = canon_lower(opts, inst, host_import2, True, host_ft2, args2)
+    assert(len(results2) == 1)
+    assert(results2[0].t == 'i32' and results2[0].v == 4)
+    assert(inst.handles.get(rt, 2).pin_count == 2)
+    canon_resource_drop(inst, rt, 4)
+    assert(inst.handles.get(rt, 2).pin_count == 1)
 
     dtor_value = None
     canon_resource_drop(inst, rt, 0)
     assert(dtor_value == 42)
-    assert(len(inst.handles.table(rt).array) == 4)
+    assert(len(inst.handles.table(rt).array) == 6)
     assert(inst.handles.table(rt).array[0] is None)
-    assert(len(inst.handles.table(rt).free) == 1)
+    assert(len(inst.handles.table(rt).free) == 2)
 
     h = canon_resource_new(inst, rt, 46)
     assert(h == 0)
-    assert(len(inst.handles.table(rt).array) == 4)
+    assert(len(inst.handles.table(rt).array) == 6)
     assert(inst.handles.table(rt).array[0] is not None)
-    assert(len(inst.handles.table(rt).free) == 0)
-
-    dtor_value = None
-    canon_resource_drop(inst, rt, 2)
-    assert(dtor_value is None)
-    assert(len(inst.handles.table(rt).array) == 4)
-    assert(inst.handles.table(rt).array[2] is None)
     assert(len(inst.handles.table(rt).free) == 1)
 
-    return [Value('i32', 0), Value('i32', 1), Value('i32', 3)]
+    return [
+      Value('i32', 0),
+      Value('i32', 1),
+      Value('i32', 3),
+      Value('i32', 5)
+    ]
+
+  def post_return(_):
+    canon_resource_drop(inst, rt, 2)
+  opts.post_return = post_return
 
   ft = FuncType([
     Own(rt),
@@ -453,25 +549,28 @@ def test_handles():
   ],[
     Own(rt),
     Own(rt),
-    Own(rt)
+    Own(rt,Parent('2')),
+    Own(rt,Parent('2'))
   ])
   args = [
-    42,
-    43,
-    44,
-    13
+    Resource(42),
+    Resource(43),
+    Resource(44),
+    Resource(13)
   ]
   got,post_return = canon_lift(opts, inst, core_wasm, ft, args)
 
-  assert(len(got) == 3)
-  assert(got[0] == 46)
-  assert(got[1] == 43)
-  assert(got[2] == 45)
-  assert(len(inst.handles.table(rt).array) == 4)
+  assert(len(got) == 4)
+  assert(got[0].rep == 46)
+  assert(got[1].rep == 43)
+  assert(got[2].rep == 45)
+  assert(got[3].rep == 61)
+  assert(len(inst.handles.table(rt).array) == 6)
+  post_return()
   assert(all(inst.handles.table(rt).array[i] is None for i in range(3)))
-  assert(len(inst.handles.table(rt).free) == 4)
+  assert(len(inst.handles.table(rt).free) == 6)
   definitions.MAX_FLAT_RESULTS = before
 
-test_handles()
+test_linear_borrow()
 
 print("All tests passed")
