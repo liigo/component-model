@@ -392,18 +392,25 @@ class Resource:
 class HandleElem:
   r: Resource
   own: bool
-  scope: None | CallContext | HandleIndex
+  scope: None | CallContext | CallParam | HandleIndex
+  param_name: Optional[str]
   pin_count: int
   next_child: Optional[HandleIndex]
 
-  def __init__(self, r, own, scope = None):
+  def __init__(self, r, own, scope = None, param_name = None):
     self.r = r
     self.own = own
     self.scope = scope
+    self.param_name = param_name
     self.pin_count = 0
     self.next_child = None
 
-@dataclass(frozen=True)
+@dataclass
+class CallParam:
+  cx: CallContext
+  param_name: str
+
+@dataclass
 class HandleIndex:
   rt: ResourceType
   i: int
@@ -430,9 +437,10 @@ class HandleTable:
       i = len(self.array)
       self.array.append(h)
     match h.scope:
-      case None          : pass
-      case CallContext() : h.scope.add_call_scoped_handle_to_table()
-      case HandleIndex() : inst.handles[h.scope].pin_count += 1
+      case None            : pass
+      case CallContext()   : h.scope.add_call_scoped_handle_to_table()
+      case CallParam(cx,_) : cx.add_call_scoped_handle_to_table()
+      case HandleIndex()   : inst.handles[h.scope].pin_count += 1
     return i
 
   def remove(self, inst, rt, i):
@@ -444,9 +452,10 @@ class HandleTable:
     self.array[i] = None
     self.free.append(i)
     match h.scope:
-      case None          : pass
-      case CallContext() : h.scope.remove_call_scoped_handle_from_table()
-      case HandleIndex() : inst.handles[h.scope].pin_count -= 1
+      case None            : pass
+      case CallContext()   : h.scope.remove_call_scoped_handle_from_table()
+      case CallParam(cx,_) : cx.remove_call_scoped_handle_from_table()
+      case HandleIndex()   : inst.handles[h.scope].pin_count -= 1
     return h
 
 class HandleTables:
@@ -652,10 +661,13 @@ def lift_handle(cx, i, t, param_name):
       match h.scope:
         case None:
           pass
-        case 'call':
+        case CallContext():
           trap()
+        case CallParam(other_cx, param_name):
+          trap_if(cx is not other_cx)
+          trap_if(param_name != t.scope.param_name)
         case HandleIndex():
-          trap_if(h.scope != cx.param_name_to_index[t.scope.param_name])
+          trap()
   return h.r
 
 ### Storing
@@ -900,13 +912,15 @@ def lower_handle(cx, r, t, param_name):
   if isinstance(t.scope, Parent):
     parent_index = cx.param_name_to_index[t.scope.param_name]
     parent = cx.inst.handles[parent_index]
-    if isinstance(parent.scope, HandleIndex):
-      scope = parent.scope
-    else:
+    if parent.own:
       scope = parent_index
+    elif isinstance(parent.scope, CallContext):
+      scope = CallParam(parent.scope, parent.param_name)
+    else:
+      scope = parent.scope
   else:
     scope = t.scope
-  h = HandleElem(r, t.own, scope)
+  h = HandleElem(r, t.own, scope, param_name)
   i = cx.inst.handles.add(cx.inst, t.rt, h)
   if param_name is not None:
     cx.param_name_to_index[param_name] = HandleIndex(t.rt, i)

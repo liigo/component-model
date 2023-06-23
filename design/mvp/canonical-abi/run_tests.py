@@ -379,27 +379,24 @@ def test_lift_handle():
   def test_pair(dst_own, dst_scope, src_own, src_scope, expect):
     cx = mk_cx()
     rt = ResourceType(cx.inst, None)
-    r = Resource(42)
-    src_scope_val = src_scope
-    if dst_scope == 'resource' or src_scope == 'resource':
-      parent_rt = ResourceType(cx.inst, None)
+    if src_scope == 'parent':
+      src_scope = CallParam(cx, 'a')
+    elif src_scope == 'call':
+      src_scope = cx
+    if dst_scope == 'parent':
       parent_r = Resource(13)
-      parent_h = HandleElem(parent_r, own=False, scope='call')
-      i = cx.inst.handles.add(cx.inst, parent_rt, parent_h)
-      parent_i = HandleIndex(parent_rt, i)
-      cx.param_name_to_index['a'] = parent_i
-      if src_scope == 'resource':
-        src_scope = Parent('a')
-        src_scope_val = parent_i
-      if dst_scope == 'resource':
-        dst_scope = Parent('a')
-    dst_ht = Handle(rt, dst_own, dst_scope)
-    src_h = HandleElem(r, own=src_own, scope=src_scope_val)
+      parent_h = HandleElem(parent_r, own=True)
+      parent_i = cx.inst.handles.add(cx.inst, rt, parent_h)
+      cx.param_name_to_index['a'] = HandleIndex(rt, parent_i)
+      dst_scope = Parent('a')
+    src_r = Resource(42)
+    src_h = HandleElem(src_r, own=src_own, scope=src_scope)
     src_i = cx.inst.handles.add(cx.inst, rt, src_h)
+    dst_t = Handle(rt, own=dst_own, scope=dst_scope)
     try:
-      result = lift_handle(cx, src_i, dst_ht, None)
+      result = lift_handle(cx, src_i, dst_t, None)
       assert(expect == 'ok')
-      assert(result is r)
+      assert(result is src_r)
     except Trap:
       assert(expect == 'bad')
 
@@ -422,13 +419,13 @@ def test_lift_handle():
 
   test_scopes(None, None)
   test_scopes(None, 'call', 'bad')
-  test_scopes(None, 'resource', 'bad')
+  test_scopes(None, 'parent', 'bad')
   test_scopes('call', None)
   test_scopes('call', 'call')
-  test_scopes('call', 'resource')
-  test_scopes('resource', None)
-  test_scopes('resource', 'call', 'bad')
-  test_scopes('resource', 'resource')
+  test_scopes('call', 'parent')
+  test_scopes('parent', None)
+  test_scopes('parent', 'call', 'bad')
+  test_scopes('parent', 'parent')
 
 test_lift_handle()
 
@@ -493,7 +490,7 @@ def test_linear_borrow():
     results = canon_lower(opts, inst, host_import, True, host_ft, args)
     assert(len(results) == 3)
     assert(inst.handles[HandleIndex(rt, 0)].pin_count == 1)
-    assert(inst.handles[HandleIndex(rt, 2)].pin_count == 1)
+    assert(inst.handles[HandleIndex(rt, 2)].pin_count == 0)
 
     assert(results[0].t == 'i32' and results[0].v == 3)
     assert(canon_resource_rep(inst, rt, 3) == 45)
@@ -506,29 +503,28 @@ def test_linear_borrow():
 
     assert(results[2].t == 'i32' and results[2].v == 5)
     assert(canon_resource_rep(inst, rt, 5) == 61)
-    assert(inst.handles.get(rt, 2).pin_count == 1)
 
     host_ft2 = FuncType([Borrow(rt)],[Own(rt,Parent('0'))])
     args2 = [Value('i32',5)]
     results2 = canon_lower(opts, inst, host_import2, True, host_ft2, args2)
     assert(len(results2) == 1)
     assert(results2[0].t == 'i32' and results2[0].v == 4)
-    assert(inst.handles.get(rt, 2).pin_count == 2)
+    canon_resource_drop(inst, rt, 2)
     canon_resource_drop(inst, rt, 4)
-    assert(inst.handles.get(rt, 2).pin_count == 1)
+    assert(len(inst.handles.table(rt).free) == 2)
 
     dtor_value = None
     canon_resource_drop(inst, rt, 0)
     assert(dtor_value == 42)
     assert(len(inst.handles.table(rt).array) == 6)
     assert(inst.handles.table(rt).array[0] is None)
-    assert(len(inst.handles.table(rt).free) == 2)
+    assert(len(inst.handles.table(rt).free) == 3)
 
     h = canon_resource_new(inst, rt, 46)
     assert(h == 0)
     assert(len(inst.handles.table(rt).array) == 6)
     assert(inst.handles.table(rt).array[0] is not None)
-    assert(len(inst.handles.table(rt).free) == 1)
+    assert(len(inst.handles.table(rt).free) == 2)
 
     return [
       Value('i32', 0),
@@ -536,10 +532,6 @@ def test_linear_borrow():
       Value('i32', 3),
       Value('i32', 5)
     ]
-
-  def post_return(_):
-    canon_resource_drop(inst, rt, 2)
-  opts.post_return = post_return
 
   ft = FuncType([
     Own(rt),
